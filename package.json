@@ -18,7 +18,8 @@
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/bin/cli.js start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "grammy": "^1.21.0",

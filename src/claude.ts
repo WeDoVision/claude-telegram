@@ -38,6 +38,10 @@ function buildArgs(
     args.push("--model", config.model);
   }
 
+  if (config.effort) {
+    args.push("--effort", config.effort);
+  }
+
   if (config.systemPrompt) {
     args.push("--append-system-prompt", config.systemPrompt);
   }

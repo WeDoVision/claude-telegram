@@ -22,6 +22,7 @@ export interface BotConfig {
   claudePath: string;
   timeout: number;
   model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
   systemPrompt?: string;
   addDirs?: string[];
   modules?: ModuleConfig[];
@@ -51,6 +52,7 @@ export interface RawConfig {
   claude_path?: string;
   timeout?: number;
   model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
   system_prompt?: string;
   add_dirs?: string[];
   modules?: ModuleConfig[];
@@ -102,6 +104,7 @@ export interface StreamJsonEvent {
       type: string;
       name?: string;
       text?: string;
+      input?: Record<string, unknown>;
     }>;
   };
 }
