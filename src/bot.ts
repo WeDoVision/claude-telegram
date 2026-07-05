@@ -634,6 +634,19 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     await ctx.reply("Conversation cleared. Claude won't remember previous messages.");
   });
 
+  // Kick off a Claude run without blocking grammy's (sequential) update loop.
+  // Awaiting the minutes-long run here would freeze the bot until it finished —
+  // including /cancel and the inline stop button, whose whole purpose is to
+  // interrupt a run in progress. Detaching keeps the poller responsive; the
+  // busy/running maps already serialize work per conversation. dispatchToClaude
+  // handles its own errors internally; the catch is a backstop against an
+  // unhandled rejection from the pre-hook stage.
+  function dispatchDetached(ctx: Context, message: string): void {
+    void dispatchToClaude(ctx, message).catch((err) => {
+      console.error("[claude-telegram] dispatch failed:", err);
+    });
+  }
+
   // --- Text message handler ---
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
@@ -646,7 +659,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     // middleware chain has already guaranteed the bot was addressed, so strip
     // its @-mention to give Claude a clean prompt.
     if (ctx.chat.type === "private") {
-      await dispatchToClaude(ctx, text);
+      dispatchDetached(ctx, text);
       return;
     }
 
@@ -656,7 +669,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       await ctx.reply("Yes? Mention me with a question, or reply to my message.");
       return;
     }
-    await dispatchToClaude(ctx, prompt);
+    dispatchDetached(ctx, prompt);
   });
 
   // --- Access-request approval (owner taps the inline buttons) ---
