@@ -86,6 +86,14 @@ permission_mode: acceptEdits
 # add_dirs:                             # additional dirs for Claude
 #   - /path/to/shared/data
 #
+# --- Optional: group chats ---
+# allow_groups: true                    # default: false (private chats only).
+#                                       # When enabled, add the bot to a group and
+#                                       # @-mention it (or reply to its messages)
+#                                       # to talk to it. Every participant is still
+#                                       # checked against `whitelist`; the whole
+#                                       # group shares one Claude conversation.
+#
 # --- Optional: multi-instance ---
 # session_namespace: my-bot               # unique seed for session IDs (required when
 #                                         # multiple bots share the same whitelist user)
@@ -268,8 +276,9 @@ npx claude-telegram whoami                   # get your Telegram user ID
 - Each user gets a persistent Claude session via `--resume <sessionId>`
 - Sessions survive bot restarts (stored in `~/.claude/` by Claude CLI)
 - Session mapping stored in `{workspace}/data/.claude-telegram/sessions.json`
-- Bot responds in private chats only (ignores group/supergroup/channel)
-- One message at a time per user (concurrent messages get "Still working..." reply)
+- Private chats only by default; set `allow_groups: true` to also work in group/supergroup chats
+- In groups the bot only replies when @-mentioned or replied to; all members share one session
+- One message at a time per conversation (concurrent messages get "Still working..." reply)
 - Live activity status shows what Claude is doing (reading, editing, searching, etc.)
 - Messages are split at 3800 chars and formatted as Telegram MarkdownV2
 
@@ -286,6 +295,7 @@ const bot = createBot({
   token: process.env.BOT_TOKEN!,
   workspace: "/path/to/workspace",
   whitelist: [16643982],
+  allowGroups: false,
   permissionMode: "acceptEdits",
   claudePath: "claude",
   timeout: 300,
