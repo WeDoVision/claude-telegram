@@ -1,4 +1,4 @@
-import type { Bot } from "grammy";
+import type { Bot, InlineKeyboard } from "grammy";
 import type { StreamJsonEvent } from "./types.js";
 
 const MIN_UPDATE_INTERVAL_MS = 3_000;
@@ -82,6 +82,12 @@ interface ActivityStatusOptions {
   api: Bot["api"];
   chatId: number;
   messageId: number;
+  /**
+   * Inline keyboard to keep attached to the status message. Telegram drops the
+   * keyboard on any editMessageText that omits reply_markup, so we re-send it on
+   * every update — otherwise a "stop" button would vanish on the first tick.
+   */
+  replyMarkup?: InlineKeyboard;
 }
 
 /**
@@ -89,7 +95,7 @@ interface ActivityStatusOptions {
  * with current Claude activity and elapsed time.
  */
 export function createActivityStatus(options: ActivityStatusOptions) {
-  const { api, chatId, messageId } = options;
+  const { api, chatId, messageId, replyMarkup } = options;
   const startTime = Date.now();
 
   let currentLabel = DEFAULT_LABEL;
@@ -114,7 +120,12 @@ export function createActivityStatus(options: ActivityStatusOptions) {
     if (text === lastSentText) return;
 
     try {
-      await api.editMessageText(chatId, messageId, text);
+      await api.editMessageText(
+        chatId,
+        messageId,
+        text,
+        replyMarkup ? { reply_markup: replyMarkup } : undefined
+      );
       lastSentText = text;
     } catch {
       // Silently ignore edit failures (rate limit, message deleted, etc.)
