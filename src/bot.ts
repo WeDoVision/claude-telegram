@@ -7,6 +7,7 @@ import { createActivityStatus } from "./activity.js";
 import { sendMessage } from "./sender.js";
 import { processTracker, setupGracefulShutdown } from "./shutdown.js";
 import { loadModules, type BotModule, type ModuleContext } from "./modules.js";
+import { addLocalWhitelist } from "./whitelist-store.js";
 
 export interface CreateBotOptions {
   modules?: BotModule[];
@@ -117,6 +118,11 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
 
   const running = new Map<number, RunningJob>();
 
+  // Non-whitelisted users awaiting owner approval. Dedupes owner pings and
+  // remembers who to label the approve/deny card with. Process-local: a restart
+  // clears it, which is fine — the next message from the user re-pings the owner.
+  const pendingAccess = new Map<number, { name: string; username?: string }>();
+
   // Avoid unhandled errors taking down the process.
   bot.catch((err) => {
     console.error("[claude-telegram] Bot error:", err.error);
@@ -169,6 +175,45 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     }
   });
 
+  // Ping the owner that a non-whitelisted user wants in, with inline
+  // approve/deny buttons. No-op unless `access_requests` is on and an `owner`
+  // is set. Deduped per user so a stranger can't spam the owner.
+  async function requestAccess(ctx: Context, userId: number): Promise<void> {
+    // Only take requests from private chats: a stranger @-mentioning the bot in
+    // a group must not be able to page the owner.
+    if (ctx.chat?.type !== "private") return;
+    if (pendingAccess.has(userId)) return;
+
+    const from = ctx.from;
+    const name =
+      [from?.first_name, from?.last_name].filter(Boolean).join(" ") || "Unknown";
+    const username = from?.username;
+    pendingAccess.set(userId, { name, username });
+
+    const who = `${name}${username ? ` (@${username})` : ""} · id ${userId}`;
+    try {
+      await bot.api.sendMessage(
+        config.owner as number,
+        `👤 Запрос доступа к боту\n\n${who}\n\nПустить?`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "✅ Пустить", callback_data: `access:ok:${userId}` },
+                { text: "🚫 Отказать", callback_data: `access:no:${userId}` },
+              ],
+            ],
+          },
+        }
+      );
+    } catch (err) {
+      // Owner unreachable — forget the pending entry so a later message retries.
+      pendingAccess.delete(userId);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[claude-telegram] Failed to send access request to owner: ${msg}`);
+    }
+  }
+
   // --- Middleware: whitelist ---
   bot.use(async (ctx, next) => {
     const userId = ctx.from?.id;
@@ -176,15 +221,22 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
 
     // Secure by default: empty whitelist means no one can use the bot.
     if (config.whitelist.length === 0 || !config.whitelist.includes(userId)) {
+      const canRequest =
+        config.accessRequests === true &&
+        typeof config.owner === "number" &&
+        ctx.chat?.type === "private";
       if (ctx.chat) {
         try {
           await ctx.reply(
-            `Sorry, you don't have access to this bot. Ask the owner to add your user ID to the whitelist.\n\nYour ID: ${userId}`
+            canRequest
+              ? `Заявка на доступ отправлена владельцу — подожди подтверждения.\n\nYour ID: ${userId}`
+              : `Sorry, you don't have access to this bot. Ask the owner to add your user ID to the whitelist.\n\nYour ID: ${userId}`
           );
         } catch {
           // Ignore reply failures for non-message updates.
         }
       }
+      if (canRequest) await requestAccess(ctx, userId);
       return;
     }
 
@@ -576,6 +628,68 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     await dispatchToClaude(ctx, prompt);
   });
 
+  // --- Access-request approval (owner taps the inline buttons) ---
+  bot.callbackQuery(/^access:(ok|no):(\d+)$/, async (ctx) => {
+    const action = ctx.match[1];
+    const targetId = Number(ctx.match[2]);
+
+    // Only the owner may approve/deny. (A non-owner's own messages are already
+    // blocked by the whitelist middleware, but guard the callback explicitly.)
+    if (ctx.from?.id !== config.owner) {
+      await ctx.answerCallbackQuery({ text: "Not allowed." });
+      return;
+    }
+
+    const info = pendingAccess.get(targetId);
+    const label = info
+      ? `${info.name}${info.username ? ` (@${info.username})` : ""} · id ${targetId}`
+      : `id ${targetId}`;
+
+    if (action === "no") {
+      pendingAccess.delete(targetId);
+      await ctx.answerCallbackQuery({ text: "Отказано" });
+      try {
+        await ctx.editMessageText(`🚫 Отказано в доступе\n\n${label}`);
+      } catch {
+        // Ignore — the card may have changed.
+      }
+      return;
+    }
+
+    // action === "ok": add live (middleware reads config.whitelist), then persist.
+    if (!config.whitelist.includes(targetId)) {
+      config.whitelist.push(targetId);
+    }
+    let persisted = true;
+    try {
+      addLocalWhitelist(config.workspace, targetId);
+    } catch (err) {
+      persisted = false;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[claude-telegram] Failed to persist approved user ${targetId}: ${msg}`);
+    }
+    pendingAccess.delete(targetId);
+
+    await ctx.answerCallbackQuery({ text: "Доступ выдан" });
+    try {
+      await ctx.editMessageText(
+        `✅ Доступ выдан${persisted ? "" : " (не записан в файл — см. логи)"}\n\n${label}`
+      );
+    } catch {
+      // Ignore.
+    }
+
+    // Let the approved user know they can start.
+    try {
+      await bot.api.sendMessage(
+        targetId,
+        "Доступ выдан ✅ Можешь пользоваться ботом — просто напиши сообщение."
+      );
+    } catch {
+      // User may have no open chat with the bot yet; ignore.
+    }
+  });
+
   return bot;
 }
 
@@ -626,6 +740,13 @@ export async function startBot(config: BotConfig): Promise<void> {
   );
   console.log(
     `[claude-telegram] Group chats: ${config.allowGroups ? "allowed (must @-mention or reply to the bot)" : "disabled (private only)"}`
+  );
+  console.log(
+    `[claude-telegram] Access requests: ${
+      config.accessRequests && typeof config.owner === "number"
+        ? `on (owner ${config.owner})`
+        : "off"
+    }`
   );
   console.log(
     `[claude-telegram] Modules: ${modules.length > 0 ? modules.map((m) => m.name).join(", ") : "(none)"}`

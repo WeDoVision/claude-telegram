@@ -16,6 +16,13 @@ export interface BotConfig {
   // responds in private chats. In groups the bot must be @-mentioned (or
   // replied to), and every participant is still checked against `whitelist`.
   allowGroups: boolean;
+  // Access requests: when true, a message from a non-whitelisted user pings the
+  // `owner` with inline approve/deny buttons instead of a silent deny. Approving
+  // adds the user live and persists to whitelist.local.json. Off by default.
+  accessRequests?: boolean;
+  // Telegram user ID that receives access requests and may approve them. Required
+  // for accessRequests to do anything; typically the first whitelist entry.
+  owner?: number;
   permissionMode:
     | "default"
     | "acceptEdits"
@@ -47,6 +54,8 @@ export interface RawConfig {
   workspace: string;
   whitelist?: number[];
   allow_groups?: boolean;
+  access_requests?: boolean;
+  owner?: number;
   permission_mode?:
     | "default"
     | "acceptEdits"
