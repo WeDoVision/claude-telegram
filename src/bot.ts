@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import { Bot, type Context } from "grammy";
+import { Bot, InlineKeyboard, type Context } from "grammy";
 import type { BotConfig, ClaudeResult } from "./types.js";
 import { SessionStore } from "./session.js";
 import { runClaude } from "./claude.js";
@@ -123,6 +123,12 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
   // clears it, which is fine — the next message from the user re-pings the owner.
   const pendingAccess = new Map<number, { name: string; username?: string }>();
 
+  // Inline "stop" button attached to the live status message: lets the user
+  // abort a running Claude with a tap, same effect as /cancel. The callback
+  // handler is registered below alongside /cancel.
+  const STOP_CALLBACK = "ct:stop";
+  const stopKeyboard = new InlineKeyboard().text("🛑 Остановись", STOP_CALLBACK);
+
   // Avoid unhandled errors taking down the process.
   bot.catch((err) => {
     console.error("[claude-telegram] Bot error:", err.error);
@@ -155,6 +161,14 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
   bot.use(async (ctx, next) => {
     const type = ctx.chat?.type;
     if (type !== "group" && type !== "supergroup") {
+      await next();
+      return;
+    }
+
+    // A button tap on one of the bot's own messages (e.g. the stop button on a
+    // status message) is inherently addressed to it — let it through. Without
+    // this, callback queries carry no ctx.message and would be dropped below.
+    if (ctx.callbackQuery) {
       await next();
       return;
     }
@@ -350,10 +364,12 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       return;
     }
 
-    // Send placeholder message
+    // Send placeholder message with the stop button attached.
     let statusMsg;
     try {
-      statusMsg = await ctx.reply("💭 Thinking  ⏱ 0:00");
+      statusMsg = await ctx.reply("💭 Thinking  ⏱ 0:00", {
+        reply_markup: stopKeyboard,
+      });
     } catch {
       busy.delete(convKey);
       return;
@@ -361,11 +377,12 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
 
     const msgId = statusMsg.message_id;
 
-    // Activity status updater
+    // Activity status updater — keeps the stop button on every edit.
     const activity = createActivityStatus({
       api: bot.api,
       chatId,
       messageId: msgId,
+      replyMarkup: stopKeyboard,
     });
 
     let job: RunningJob | undefined;
@@ -517,25 +534,15 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     }
   });
 
-  bot.command("cancel", async (ctx) => {
-    const convKey = ctx.chat?.id;
-    if (convKey === undefined) return;
-
-    const job = running.get(convKey);
-    if (!job) {
-      await ctx.reply("Nothing to cancel.");
-      return;
-    }
-
-    if (job.canceled) {
-      await ctx.reply("Already cancelling...");
-      return;
-    }
-
+  // Stop a running job: freeze status updates, drop the stop button, and kill
+  // the Claude process (SIGTERM now, SIGKILL after a grace period). Shared by
+  // /cancel, /clear, and the inline stop button. Returns whether the status
+  // message was successfully edited (so callers can fall back to a reply).
+  async function stopJob(convKey: number, job: RunningJob): Promise<boolean> {
     job.canceled = true;
     job.activity.stop();
 
-    // Best-effort status update; only send a separate reply if the edit fails.
+    // Editing without reply_markup also removes the stop button.
     let statusUpdated = false;
     try {
       await bot.api.editMessageText(
@@ -563,9 +570,55 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       }
     }, 5000);
 
+    return statusUpdated;
+  }
+
+  bot.command("cancel", async (ctx) => {
+    const convKey = ctx.chat?.id;
+    if (convKey === undefined) return;
+
+    const job = running.get(convKey);
+    if (!job) {
+      await ctx.reply("Nothing to cancel.");
+      return;
+    }
+
+    if (job.canceled) {
+      await ctx.reply("Already cancelling...");
+      return;
+    }
+
+    const statusUpdated = await stopJob(convKey, job);
     if (!statusUpdated) {
       await ctx.reply("Cancelling... (may take a few seconds)");
     }
+  });
+
+  // Inline stop button on the live status message — same effect as /cancel,
+  // but without typing a command.
+  bot.callbackQuery(STOP_CALLBACK, async (ctx) => {
+    const convKey = ctx.chat?.id;
+    const job = convKey !== undefined ? running.get(convKey) : undefined;
+
+    // The button must belong to the current job's status message. A tap on a
+    // stale button (from an older message) must never kill a newer request.
+    const btnMessageId = ctx.callbackQuery.message?.message_id;
+    if (
+      convKey === undefined ||
+      !job ||
+      (btnMessageId !== undefined && job.statusMessageId !== btnMessageId)
+    ) {
+      await ctx.answerCallbackQuery("Нечего останавливать — задача уже завершена.");
+      return;
+    }
+
+    if (job.canceled) {
+      await ctx.answerCallbackQuery("Уже останавливаю…");
+      return;
+    }
+
+    await ctx.answerCallbackQuery("Останавливаю…");
+    await stopJob(convKey, job);
   });
 
   bot.command("clear", async (ctx) => {
@@ -574,29 +627,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
 
     const job = running.get(convKey);
     if (job && !job.canceled) {
-      job.canceled = true;
-      job.activity.stop();
-      try {
-        await bot.api.editMessageText(
-          job.chatId,
-          job.statusMessageId,
-          "Cancelling..."
-        );
-      } catch {
-        // Ignore
-      }
-      try {
-        job.child.kill("SIGTERM");
-      } catch {
-        // Ignore
-      }
-      setTimeout(() => {
-        try {
-          if (running.get(convKey) === job) job.child.kill("SIGKILL");
-        } catch {
-          // Ignore
-        }
-      }, 5000);
+      await stopJob(convKey, job);
     }
 
     sessionStore.resetSession(convKey);
