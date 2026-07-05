@@ -3,12 +3,15 @@ import { resolve } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
 import type { BotConfig, RawConfig } from "./types.js";
+import { readLocalWhitelist } from "./whitelist-store.js";
 
 const configSchema = z.object({
   token: z.string().min(1, "token is required"),
   workspace: z.string().min(1, "workspace is required"),
   whitelist: z.array(z.number()).default([]),
   allow_groups: z.boolean().default(false),
+  access_requests: z.boolean().default(false),
+  owner: z.number().optional(),
   permission_mode: z
     .enum([
       "default",
@@ -105,11 +108,18 @@ export function loadConfig(configPath?: string): BotConfig {
     throw new Error(`Workspace directory does not exist: ${workspace}`);
   }
 
+  // Effective whitelist = hand-curated (yaml) + runtime-approved (sidecar), deduped.
+  const whitelist = Array.from(
+    new Set([...validated.whitelist, ...readLocalWhitelist(workspace)])
+  );
+
   return {
     token: validated.token,
     workspace,
-    whitelist: validated.whitelist,
+    whitelist,
     allowGroups: validated.allow_groups,
+    accessRequests: validated.access_requests,
+    owner: validated.owner,
     permissionMode: validated.permission_mode,
     claudePath: validated.claude_path,
     timeout: validated.timeout,
