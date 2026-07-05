@@ -5,7 +5,12 @@ import type { SessionStore } from "./session.js";
 export interface RunClaudeOptions {
   config: BotConfig;
   sessionStore: SessionStore;
-  userId: number;
+  /**
+   * Conversation identity used to key the Claude session. In private chats
+   * this is the user ID; in group chats it is the (negative) chat ID so the
+   * whole group shares one conversation.
+   */
+  sessionKey: number;
   message: string;
   onEvent?: (event: StreamJsonEvent) => void;
 }
@@ -139,8 +144,8 @@ export function runClaude(options: RunClaudeOptions): {
   promise: Promise<ClaudeResult>;
   child: ChildProcess;
 } {
-  const { config, sessionStore, userId, message, onEvent } = options;
-  const { sessionId, isNew } = sessionStore.getSession(userId);
+  const { config, sessionStore, sessionKey, message, onEvent } = options;
+  const { sessionId, isNew } = sessionStore.getSession(sessionKey);
   const args = buildArgs(config, sessionId, isNew, message);
 
   const child = spawn(config.claudePath, args, {
@@ -227,7 +232,7 @@ export function runClaude(options: RunClaudeOptions): {
         (stderr.includes("session") || stderr.includes("not found") || stderr.includes("ENOENT"))
       ) {
         // Session lost — refresh and let caller retry or handle
-        sessionStore.refreshSession(userId);
+        sessionStore.refreshSession(sessionKey);
         resolve({
           success: false,
           output: "",
@@ -251,7 +256,7 @@ export function runClaude(options: RunClaudeOptions): {
       }
 
       const { output, costUsd } = extractResult(events);
-      if (isNew) sessionStore.confirmSession(userId);
+      if (isNew) sessionStore.confirmSession(sessionKey);
       resolve({
         success: true,
         output: output || "",

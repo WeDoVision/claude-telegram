@@ -13,6 +13,45 @@ export interface CreateBotOptions {
   onModuleContext?: (ctx: ModuleContext) => void;
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * In a group chat the bot only reacts when explicitly addressed: a reply to
+ * one of its own messages, or an @-mention of its username.
+ */
+function isBotTriggered(ctx: Context): boolean {
+  const msg = ctx.message;
+  if (!msg) return false;
+
+  // A reply to one of the bot's own messages counts as addressing it.
+  if (msg.reply_to_message?.from?.id === ctx.me.id) return true;
+
+  const text = msg.text ?? msg.caption ?? "";
+  const entities = msg.entities ?? msg.caption_entities ?? [];
+  const username = ctx.me.username?.toLowerCase();
+
+  for (const e of entities) {
+    if (e.type === "text_mention" && e.user?.id === ctx.me.id) return true;
+    if (e.type === "mention" && username) {
+      const mentioned = text.slice(e.offset, e.offset + e.length).toLowerCase();
+      if (mentioned === `@${username}`) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Strip the bot's @-mention from a message before handing it to Claude,
+ * so "@persona what's up?" becomes "what's up?".
+ */
+function stripBotMention(text: string, username?: string): string {
+  if (!username) return text.trim();
+  const re = new RegExp(`@${escapeRegExp(username)}(?![A-Za-z0-9_])`, "gi");
+  return text.replace(re, " ").replace(/\s{2,}/g, " ").trim();
+}
+
 function sanitizeErrorForUser(text: string, workspace: string, maxLen: number): string {
   const normalized = text.replace(/\r\n/g, "\n").trim();
   if (!normalized) return "";
@@ -83,20 +122,51 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     console.error("[claude-telegram] Bot error:", err.error);
   });
 
-  // --- Middleware: private chat only ---
+  // --- Middleware: allowed chat types ---
   bot.use(async (ctx, next) => {
     if (!ctx.chat) return;
-    if (ctx.chat.type !== "private") {
-      try {
-        if (ctx.message) {
-          await ctx.reply("Please message me in a private chat.");
-        }
-      } catch {
-        // Ignore reply failures.
-      }
+    const type = ctx.chat.type;
+    const isGroup = type === "group" || type === "supergroup";
+
+    if (type === "private" || (isGroup && config.allowGroups)) {
+      await next();
       return;
     }
-    await next();
+
+    // Private-only mode (or a channel): decline, but only reply to a real
+    // message so we don't react to service/non-message updates.
+    try {
+      if (ctx.message) {
+        await ctx.reply("Please message me in a private chat.");
+      }
+    } catch {
+      // Ignore reply failures.
+    }
+    return;
+  });
+
+  // --- Middleware: in groups, only react when addressed ---
+  bot.use(async (ctx, next) => {
+    const type = ctx.chat?.type;
+    if (type !== "group" && type !== "supergroup") {
+      await next();
+      return;
+    }
+
+    // Let commands through to their handlers (grammy matches /cmd@botname).
+    const text = ctx.message?.text ?? ctx.message?.caption;
+    if (typeof text === "string" && text.startsWith("/")) {
+      await next();
+      return;
+    }
+
+    // Otherwise require an explicit @-mention or a reply to the bot. Untargeted
+    // group chatter is ignored silently — importantly, before the whitelist
+    // check, so non-whitelisted members' normal messages don't trigger the
+    // "no access" reply (which would spam the group if privacy mode is off).
+    if (isBotTriggered(ctx)) {
+      await next();
+    }
   });
 
   // --- Middleware: whitelist ---
@@ -189,21 +259,24 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
   }
 
   async function dispatchToClaude(ctx: Context, message: string): Promise<void> {
-    const userId = ctx.from?.id;
     const chatId = ctx.chat?.id;
 
-    if (!userId || !chatId) return;
+    if (chatId === undefined) return;
     if (!message || !message.trim()) return;
 
-    // Concurrency guard: one message at a time per user
-    if (busy.has(userId)) {
+    // Conversation key: private chats key by user (chat.id === user.id),
+    // group chats key by chat so the whole group shares one session.
+    const convKey = chatId;
+
+    // Concurrency guard: one running Claude process per conversation.
+    if (busy.has(convKey)) {
       await ctx.reply(
-        "Still working on your previous message. Send /cancel to stop, or wait for the response."
+        "Still working on the previous message. Send /cancel to stop, or wait for the response."
       );
       return;
     }
 
-    busy.add(userId);
+    busy.add(convKey);
 
     // Give modules a chance to deny/transform the message before starting Claude.
     const before = await runBeforeClaudeHooks(ctx, message);
@@ -215,13 +288,13 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
           // Ignore
         }
       }
-      busy.delete(userId);
+      busy.delete(convKey);
       return;
     }
 
     const finalMessage = before.message;
     if (!finalMessage || !finalMessage.trim()) {
-      busy.delete(userId);
+      busy.delete(convKey);
       return;
     }
 
@@ -230,7 +303,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     try {
       statusMsg = await ctx.reply("💭 Thinking  ⏱ 0:00");
     } catch {
-      busy.delete(userId);
+      busy.delete(convKey);
       return;
     }
 
@@ -248,7 +321,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       const { promise, child } = runClaude({
         config,
         sessionStore,
-        userId,
+        sessionKey: convKey,
         message: finalMessage,
         onEvent: activity.onEvent,
       });
@@ -260,12 +333,12 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
         activity,
         canceled: false,
       };
-      running.set(userId, job);
+      running.set(convKey, job);
 
       processTracker.register(child);
 
       const result = await promise;
-      if (running.get(userId) === job) running.delete(userId);
+      if (running.get(convKey) === job) running.delete(convKey);
       activity.stop();
 
       // Delete the status message
@@ -304,7 +377,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       }
     } catch (err) {
       activity.stop();
-      if (job && running.get(userId) === job) running.delete(userId);
+      if (job && running.get(convKey) === job) running.delete(convKey);
 
       // Try to update the status message with error
       try {
@@ -325,7 +398,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
         // Give up on status message
       }
     } finally {
-      busy.delete(userId);
+      busy.delete(convKey);
     }
   }
 
@@ -393,10 +466,10 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
   });
 
   bot.command("cancel", async (ctx) => {
-    const userId = ctx.from?.id;
-    if (!userId) return;
+    const convKey = ctx.chat?.id;
+    if (convKey === undefined) return;
 
-    const job = running.get(userId);
+    const job = running.get(convKey);
     if (!job) {
       await ctx.reply("Nothing to cancel.");
       return;
@@ -430,7 +503,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     }
     setTimeout(() => {
       try {
-        if (running.get(userId) === job) {
+        if (running.get(convKey) === job) {
           job.child.kill("SIGKILL");
         }
       } catch {
@@ -444,10 +517,10 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
   });
 
   bot.command("clear", async (ctx) => {
-    const userId = ctx.from?.id;
-    if (!userId) return;
+    const convKey = ctx.chat?.id;
+    if (convKey === undefined) return;
 
-    const job = running.get(userId);
+    const job = running.get(convKey);
     if (job && !job.canceled) {
       job.canceled = true;
       job.activity.stop();
@@ -467,28 +540,40 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       }
       setTimeout(() => {
         try {
-          if (running.get(userId) === job) job.child.kill("SIGKILL");
+          if (running.get(convKey) === job) job.child.kill("SIGKILL");
         } catch {
           // Ignore
         }
       }, 5000);
     }
 
-    sessionStore.resetSession(userId);
+    sessionStore.resetSession(convKey);
     await ctx.reply("Conversation cleared. Claude won't remember previous messages.");
   });
 
   // --- Text message handler ---
   bot.on("message:text", async (ctx) => {
-    const userId = ctx.from?.id;
     const text = ctx.message.text;
-
-    if (!userId || !text) return;
+    if (!text) return;
 
     // Skip commands (already handled above)
     if (text.startsWith("/")) return;
 
-    await dispatchToClaude(ctx, text);
+    // In private chats the text is passed through as-is. In groups the
+    // middleware chain has already guaranteed the bot was addressed, so strip
+    // its @-mention to give Claude a clean prompt.
+    if (ctx.chat.type === "private") {
+      await dispatchToClaude(ctx, text);
+      return;
+    }
+
+    const prompt = stripBotMention(text, ctx.me.username);
+    if (!prompt) {
+      // Bare mention with no actual question.
+      await ctx.reply("Yes? Mention me with a question, or reply to my message.");
+      return;
+    }
+    await dispatchToClaude(ctx, prompt);
   });
 
   return bot;
@@ -538,6 +623,9 @@ export async function startBot(config: BotConfig): Promise<void> {
   console.log(`[claude-telegram] Permission mode: ${config.permissionMode}`);
   console.log(
     `[claude-telegram] Whitelist: ${config.whitelist.length > 0 ? config.whitelist.join(", ") : "(empty — no one can access)"}`
+  );
+  console.log(
+    `[claude-telegram] Group chats: ${config.allowGroups ? "allowed (must @-mention or reply to the bot)" : "disabled (private only)"}`
   );
   console.log(
     `[claude-telegram] Modules: ${modules.length > 0 ? modules.map((m) => m.name).join(", ") : "(none)"}`

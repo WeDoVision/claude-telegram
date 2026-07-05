@@ -12,6 +12,10 @@ export interface BotConfig {
   token: string;
   workspace: string;
   whitelist: number[];
+  // Allow group/supergroup chats. When false (default) the bot only
+  // responds in private chats. In groups the bot must be @-mentioned (or
+  // replied to), and every participant is still checked against `whitelist`.
+  allowGroups: boolean;
   permissionMode:
     | "default"
     | "acceptEdits"
@@ -42,6 +46,7 @@ export interface RawConfig {
   token: string;
   workspace: string;
   whitelist?: number[];
+  allow_groups?: boolean;
   permission_mode?:
     | "default"
     | "acceptEdits"
