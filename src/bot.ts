@@ -410,16 +410,28 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       if (running.get(convKey) === job) running.delete(convKey);
       activity.stop();
 
-      // Delete the status message
+      if (job.canceled) {
+        // Stopped by the user (button, /cancel or /clear): keep the status
+        // message as a "stopped" marker instead of deleting it, and post
+        // whatever Claude wrote before it was killed so the partial answer
+        // isn't lost.
+        try {
+          await bot.api.editMessageText(chatId, msgId, "🛑 Остановлено");
+        } catch {
+          // Ignore — message may already be gone.
+        }
+        const partial = result.partialOutput?.trim();
+        if (partial) {
+          await sendMessage(ctx, partial, { footer: "🛑 остановлено" });
+        }
+        return;
+      }
+
+      // Normal completion: drop the status placeholder, then send the answer.
       try {
         await bot.api.deleteMessage(chatId, msgId);
       } catch {
         // Ignore — message may already be deleted
-      }
-
-      if (job.canceled) {
-        // Cancel was already acknowledged by /cancel or /clear.
-        return;
       }
 
       const finalResult = await runAfterClaudeHooks(ctx, result);
@@ -548,7 +560,7 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       await bot.api.editMessageText(
         job.chatId,
         job.statusMessageId,
-        "Cancelling..."
+        "⏹ Останавливаю…"
       );
       statusUpdated = true;
     } catch {
@@ -579,18 +591,18 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
 
     const job = running.get(convKey);
     if (!job) {
-      await ctx.reply("Nothing to cancel.");
+      await ctx.reply("Нечего останавливать.");
       return;
     }
 
     if (job.canceled) {
-      await ctx.reply("Already cancelling...");
+      await ctx.reply("Уже останавливаю…");
       return;
     }
 
     const statusUpdated = await stopJob(convKey, job);
     if (!statusUpdated) {
-      await ctx.reply("Cancelling... (may take a few seconds)");
+      await ctx.reply("⏹ Останавливаю… (пара секунд)");
     }
   });
 

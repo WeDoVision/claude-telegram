@@ -105,6 +105,22 @@ function parseStreamLine(line: string): StreamJsonEvent | null {
 }
 
 /**
+ * Collect assistant text blocks streamed so far. Serves both as the result
+ * fallback and as the partial answer surfaced when a run is interrupted.
+ */
+function collectAssistantText(events: StreamJsonEvent[]): string {
+  const texts: string[] = [];
+  for (const event of events) {
+    if (event.type === "assistant" && event.message?.content) {
+      for (const block of event.message.content) {
+        if (block.type === "text" && block.text) texts.push(block.text);
+      }
+    }
+  }
+  return texts.join("\n");
+}
+
+/**
  * Extract final result text from stream-json events.
  */
 function extractResult(events: StreamJsonEvent[]): {
@@ -122,19 +138,8 @@ function extractResult(events: StreamJsonEvent[]): {
     }
   }
 
-  // Fallback: collect text from assistant messages
-  const texts: string[] = [];
-  for (const event of events) {
-    if (event.type === "assistant" && event.message?.content) {
-      for (const block of event.message.content) {
-        if (block.type === "text" && block.text) {
-          texts.push(block.text);
-        }
-      }
-    }
-  }
-
-  return { output: texts.join("\n") };
+  // Fallback: collect streamed assistant text.
+  return { output: collectAssistantText(events) };
 }
 
 /**
@@ -213,6 +218,10 @@ export function runClaude(options: RunClaudeOptions): {
         }
       }
 
+      // Assistant text captured so far — surfaced as a partial answer when the
+      // run was interrupted (external stop / timeout / non-zero exit).
+      const partialOutput = collectAssistantText(events);
+
       if (killed) {
         resolve({
           success: false,
@@ -220,6 +229,7 @@ export function runClaude(options: RunClaudeOptions): {
           error: `Claude took too long (>${Math.floor(config.timeout / 60)}min). Try a simpler request or send again.`,
           sessionId: detectedSessionId || sessionId,
           durationMs,
+          partialOutput,
         });
         return;
       }
@@ -239,6 +249,7 @@ export function runClaude(options: RunClaudeOptions): {
           error: "Conversation couldn't be restored (session expired). Send your message again to start fresh.",
           sessionId: detectedSessionId || sessionId,
           durationMs,
+          partialOutput,
         });
         return;
       }
@@ -251,6 +262,7 @@ export function runClaude(options: RunClaudeOptions): {
           error: errorText,
           sessionId: detectedSessionId || sessionId,
           durationMs,
+          partialOutput,
         });
         return;
       }

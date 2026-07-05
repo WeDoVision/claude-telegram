@@ -88,6 +88,12 @@ export interface ClaudeResult {
   sessionId?: string;
   costUsd?: number;
   durationMs: number;
+  /**
+   * Assistant text captured from the stream before the run ended. Used to show
+   * a partial answer when a run was stopped or killed. Empty if nothing was
+   * written yet.
+   */
+  partialOutput?: string;
 }
 
 export interface ClaudeProcess {
