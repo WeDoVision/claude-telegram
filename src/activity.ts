@@ -5,6 +5,11 @@ const MIN_UPDATE_INTERVAL_MS = 3_000;
 
 const DEFAULT_LABEL = "💭 Думаю";
 
+// Keep the message well under Telegram's 4096-char hard limit and readable.
+const MAX_HISTORY_LINES = 25;
+const MAX_LINE_LEN = 64;
+const MAX_TEXT_LEN = 3_900;
+
 // Built-in tools → icon + verb. File/target detail is appended when available.
 const TOOL_LABELS: Record<string, string> = {
   Read: "📖 Читаю",
@@ -22,6 +27,10 @@ const TOOL_LABELS: Record<string, string> = {
 
 function capitalize(s: string): string {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+function clamp(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
 }
 
 /** Short, human target from a tool's input (file name, query, url, command…). */
@@ -49,32 +58,41 @@ function toolTarget(input: Record<string, unknown> | undefined): string | null {
  *   Read {file_path: .../CLAUDE.md} → "📖 Читаю CLAUDE.md"
  */
 function toolLabel(name: string, input?: Record<string, unknown>): string {
+  let label: string;
   if (name.startsWith("mcp__")) {
     const parts = name.split("__");
     const server = parts[1] || "mcp";
     const tool = parts.slice(2).join("__");
-    return tool ? `🔌 ${capitalize(server)} · ${tool}` : `🔌 ${capitalize(server)}`;
+    label = tool ? `🔌 ${capitalize(server)} · ${tool}` : `🔌 ${capitalize(server)}`;
+  } else {
+    const base = TOOL_LABELS[name] || `🔧 ${name}`;
+    const target = toolTarget(input);
+    label = target ? `${base} ${target}` : base;
   }
-  const base = TOOL_LABELS[name] || `🔧 ${name}`;
-  const target = toolTarget(input);
-  return target ? `${base} ${target}` : base;
+  return clamp(label, MAX_LINE_LEN);
 }
 
-/** Latest actionable label from a stream-json event, or null if nothing new. */
-function detectLabel(event: StreamJsonEvent): string | null {
+interface Activity {
+  label: string;
+  /** A real tool call (goes into history) vs a transient phase (think/answer). */
+  isTool: boolean;
+}
+
+/** Latest actionable activity from a stream-json event, or null if nothing new. */
+function detectActivity(event: StreamJsonEvent): Activity | null {
   if (event.type !== "assistant" || !event.message?.content) return null;
   // Prefer the last tool_use in the block (most recent action).
-  let label: string | null = null;
+  let toolLine: string | null = null;
   let sawText = false;
   for (const block of event.message.content) {
     if (block.type === "tool_use" && block.name) {
-      label = toolLabel(block.name, block.input);
+      toolLine = toolLabel(block.name, block.input);
     } else if (block.type === "text" && block.text?.trim()) {
       sawText = true;
     }
   }
-  if (label) return label;
-  if (sawText) return "✍️ Отвечаю";
+  if (toolLine) return { label: toolLine, isTool: true };
+  if (sawText) return { label: "✍️ Отвечаю", isTool: false };
   return null;
 }
 
@@ -91,13 +109,18 @@ interface ActivityStatusOptions {
 }
 
 /**
- * Create an activity status updater that edits a Telegram message
- * with current Claude activity and elapsed time.
+ * Create an activity status updater that edits a Telegram message with the
+ * running history of Claude's tool calls (one line each) plus the current
+ * activity and elapsed time on the last line. The history accumulates instead
+ * of being overwritten, so the finished message shows everything Claude did.
  */
 export function createActivityStatus(options: ActivityStatusOptions) {
   const { api, chatId, messageId, replyMarkup } = options;
   const startTime = Date.now();
 
+  // Distinct tool-call lines in order. Transient phases (think/answer) are not
+  // recorded here — they only surface as the live active line.
+  const history: string[] = [];
   let currentLabel = DEFAULT_LABEL;
   let lastSentText = "";
   let stopped = false;
@@ -111,14 +134,41 @@ export function createActivityStatus(options: ActivityStatusOptions) {
     return `${min}:${String(sec).padStart(2, "0")}`;
   }
 
-  async function sendUpdate() {
-    if (stopped) return;
+  /** History capped to the last N lines, with a marker for anything hidden. */
+  function cappedHistory(): string[] {
+    if (history.length <= MAX_HISTORY_LINES) return [...history];
+    const hidden = history.length - MAX_HISTORY_LINES;
+    return [`⋯ ещё ${hidden} выше`, ...history.slice(-MAX_HISTORY_LINES)];
+  }
 
+  /**
+   * Snapshot of the tool history, optionally with a final footer line (e.g.
+   * "🛑 Остановлено") in place of the live timer. Used to finalize the message
+   * on stop while keeping the history visible.
+   */
+  function snapshot(footer?: string): string {
+    const base = history.length ? cappedHistory() : [];
+    const lines = footer ? [...base, footer] : base;
+    const text = lines.length ? lines.join("\n") : DEFAULT_LABEL;
+    return text.slice(0, MAX_TEXT_LEN);
+  }
+
+  /** Live text: history plus the current activity + elapsed on the last line. */
+  function liveText(): string {
     const elapsed = formatElapsed(Date.now() - startTime);
-    const text = `${currentLabel}  ⏱ ${elapsed}`;
+    const lines = cappedHistory();
+    const lastHist = history[history.length - 1];
+    if (currentLabel === lastHist && lines.length > 0) {
+      // The active action is the last tool — put the timer on it.
+      lines[lines.length - 1] = `${lines[lines.length - 1]}  ⏱ ${elapsed}`;
+    } else {
+      // A transient phase (think/answer) or an empty history — show it below.
+      lines.push(`${currentLabel}  ⏱ ${elapsed}`);
+    }
+    return lines.join("\n").slice(0, MAX_TEXT_LEN);
+  }
 
-    if (text === lastSentText) return;
-
+  async function edit(text: string): Promise<void> {
     try {
       await api.editMessageText(
         chatId,
@@ -132,10 +182,22 @@ export function createActivityStatus(options: ActivityStatusOptions) {
     }
   }
 
+  async function sendUpdate() {
+    if (stopped) return;
+    const text = liveText();
+    if (text === lastSentText) return;
+    await edit(text);
+  }
+
   function onEvent(event: StreamJsonEvent) {
     if (stopped) return;
-    const label = detectLabel(event);
-    if (label) currentLabel = label;
+    const act = detectActivity(event);
+    if (!act) return;
+    currentLabel = act.label;
+    // Record tool calls (deduping only consecutive repeats of the same line).
+    if (act.isTool && history[history.length - 1] !== act.label) {
+      history.push(act.label);
+    }
   }
 
   function stop() {
@@ -146,5 +208,5 @@ export function createActivityStatus(options: ActivityStatusOptions) {
   // Send first update immediately
   void sendUpdate();
 
-  return { onEvent, stop };
+  return { onEvent, stop, snapshot };
 }
