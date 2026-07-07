@@ -414,9 +414,13 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
         // Stopped by the user (button, /cancel or /clear): keep the status
         // message as a "stopped" marker instead of deleting it, and post
         // whatever Claude wrote before it was killed so the partial answer
-        // isn't lost.
+        // isn't lost. Keep the accumulated tool history above the marker.
         try {
-          await bot.api.editMessageText(chatId, msgId, "🛑 Остановлено");
+          await bot.api.editMessageText(
+            chatId,
+            msgId,
+            activity.snapshot("🛑 Остановлено")
+          );
         } catch {
           // Ignore — message may already be gone.
         }
@@ -554,13 +558,14 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
     job.canceled = true;
     job.activity.stop();
 
-    // Editing without reply_markup also removes the stop button.
+    // Editing without reply_markup also removes the stop button. Keep the
+    // accumulated tool history above the "stopping" marker.
     let statusUpdated = false;
     try {
       await bot.api.editMessageText(
         job.chatId,
         job.statusMessageId,
-        "⏹ Останавливаю…"
+        job.activity.snapshot("⏹ Останавливаю…")
       );
       statusUpdated = true;
     } catch {
