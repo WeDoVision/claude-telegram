@@ -5,7 +5,7 @@ import { SessionStore } from "./session.js";
 import { runClaude } from "./claude.js";
 import { createActivityStatus } from "./activity.js";
 import { sendMessage } from "./sender.js";
-import { processTracker, setupGracefulShutdown } from "./shutdown.js";
+import { killProcessTree, processTracker, setupGracefulShutdown } from "./shutdown.js";
 import { loadModules, type BotModule, type ModuleContext } from "./modules.js";
 import { addLocalWhitelist } from "./whitelist-store.js";
 
@@ -567,18 +567,13 @@ export function createBot(config: BotConfig, options: CreateBotOptions = {}): Bo
       // Ignore
     }
 
-    try {
-      job.child.kill("SIGTERM");
-    } catch {
-      // Ignore
-    }
+    // Kill Claude together with its MCP children (process group), else the
+    // orphans linger and keep the session locked → next message fails with
+    // "Session ID … is already in use".
+    killProcessTree(job.child, "SIGTERM");
     setTimeout(() => {
-      try {
-        if (running.get(convKey) === job) {
-          job.child.kill("SIGKILL");
-        }
-      } catch {
-        // Ignore
+      if (running.get(convKey) === job) {
+        killProcessTree(job.child, "SIGKILL");
       }
     }, 5000);
 

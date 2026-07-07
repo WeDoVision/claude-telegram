@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { BotConfig, ClaudeResult, StreamJsonEvent } from "./types.js";
 import type { SessionStore } from "./session.js";
+import { killProcessTree } from "./shutdown.js";
 
 export interface RunClaudeOptions {
   config: BotConfig;
@@ -157,6 +158,11 @@ export function runClaude(options: RunClaudeOptions): {
     cwd: config.workspace,
     env: { ...process.env },
     stdio: ["ignore", "pipe", "pipe"],
+    // Own process group so a stop/timeout can kill Claude together with the
+    // MCP servers it spawns (see killProcessTree). Without this, killing only
+    // Claude's PID orphans the MCP children — they leak and keep the session
+    // locked.
+    detached: true,
   });
 
   const promise = new Promise<ClaudeResult>((resolve) => {
@@ -169,9 +175,9 @@ export function runClaude(options: RunClaudeOptions): {
     // Timeout
     const timer = setTimeout(() => {
       killed = true;
-      child.kill("SIGTERM");
+      killProcessTree(child, "SIGTERM");
       setTimeout(() => {
-        if (!child.killed) child.kill("SIGKILL");
+        if (!child.killed) killProcessTree(child, "SIGKILL");
       }, 5000);
     }, config.timeout * 1000);
 
@@ -234,19 +240,27 @@ export function runClaude(options: RunClaudeOptions): {
         return;
       }
 
-      // Check for session-not-found in stderr and retry with new session
+      // Session couldn't be resumed — drop it and let the next message start
+      // fresh. Covers a lost/expired session ("not found", ENOENT) and a
+      // session still locked by a previous run ("already in use"), e.g. after a
+      // hard stop. Case-insensitive: the CLI prints "Session ID … is already in
+      // use" with a capital S.
       const stderr = stderrChunks.join("");
+      const stderrLc = stderr.toLowerCase();
       if (
         code !== 0 &&
         !isNew &&
-        (stderr.includes("session") || stderr.includes("not found") || stderr.includes("ENOENT"))
+        (stderrLc.includes("session") ||
+          stderrLc.includes("not found") ||
+          stderrLc.includes("enoent") ||
+          stderrLc.includes("already in use"))
       ) {
-        // Session lost — refresh and let caller retry or handle
+        // Session lost or locked — refresh and let caller retry or handle
         sessionStore.refreshSession(sessionKey);
         resolve({
           success: false,
           output: "",
-          error: "Conversation couldn't be restored (session expired). Send your message again to start fresh.",
+          error: "Conversation couldn't be restored (session was busy or expired). Send your message again to start fresh.",
           sessionId: detectedSessionId || sessionId,
           durationMs,
           partialOutput,
