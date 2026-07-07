@@ -1,6 +1,32 @@
 import type { ChildProcess } from "node:child_process";
 
 /**
+ * Kill a child together with everything it spawned (Claude and its MCP
+ * servers). The child is started with `detached: true` so it leads its own
+ * process group; signalling the negative PID hits the whole group. Killing only
+ * `child.pid` would orphan the MCP servers — they linger, pile up as a memory
+ * leak, and keep the session lock held (next `--resume` then fails with
+ * "Session ID … is already in use"). Falls back to the single process if the
+ * group is already gone or the platform lacks process groups (e.g. Windows).
+ */
+export function killProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals = "SIGTERM"
+): void {
+  const pid = child.pid;
+  if (!pid) return;
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // Already exited.
+    }
+  }
+}
+
+/**
  * Tracks running Claude CLI processes for graceful shutdown.
  */
 class ProcessTracker {
@@ -31,11 +57,7 @@ class ProcessTracker {
 
   killAll(signal: NodeJS.Signals = "SIGKILL"): void {
     for (const proc of this.processes.values()) {
-      try {
-        proc.kill(signal);
-      } catch {
-        // Process may have already exited
-      }
+      killProcessTree(proc, signal);
     }
   }
 }
